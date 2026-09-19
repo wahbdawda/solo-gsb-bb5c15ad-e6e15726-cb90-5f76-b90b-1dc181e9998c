@@ -5,4 +5,8 @@ services:
     container_name: seal-chain-api
     ports:
       - "${HOST_PORT:-8000}:8000"
+    environment:
+      # validate-chunk 续接令牌的 HMAC 签名密钥；未设置（或为空）时回退到
+      # 仅适用于本地开发的内置默认值，生产部署请显式注入稳定密钥。
+      SEAL_CHAIN_TOKEN_SECRET: "${SEAL_CHAIN_TOKEN_SECRET:-}"
     restart: unless-stopped

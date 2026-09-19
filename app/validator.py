@@ -20,7 +20,11 @@ from .models import Event, EventResult, EventType, ValidateResponse, Violation
 
 @dataclass
 class ChainState:
-    """校验过程中维护的封签链状态。"""
+    """校验过程中维护的封签链状态。
+
+    该状态可被分段校验接口序列化进 continuation token，下一段以其为起点
+    继续推进，从而保证逐事件判定与一次性校验完整链路完全一致。
+    """
 
     sealed: bool = False
     ever_sealed: bool = False
@@ -96,13 +100,22 @@ def _apply_event(state: ChainState, event: Event) -> None:
         # 开封不改变保管人
 
 
-def validate_events(events: List[Event]) -> ValidateResponse:
-    """按顺序校验整条事件链，返回逐事件结果与全部违规。"""
-    state = ChainState()
+def run_state_machine(
+    state: ChainState,
+    events: List[Event],
+    index_offset: int = 0,
+) -> tuple[List[EventResult], List[Violation]]:
+    """从给定状态出发按顺序推进状态机，返回 (逐事件结果, 违规列表)。
+
+    ``index_offset`` 为全链偏移：事件 ``events[i]`` 的结果下标为
+    ``index_offset + i``。分段校验时即此前各段的累计事件数，因此逐事件
+    下标与把所有分段拼接后一次性校验完全一致。``state`` 会被原地推进。
+    """
     results: List[EventResult] = []
     violations: List[Violation] = []
 
-    for index, event in enumerate(events):
+    for offset, event in enumerate(events):
+        index = index_offset + offset
         reason = _check_event(state, event)
         if reason is None:
             _apply_event(state, event)
@@ -113,6 +126,14 @@ def validate_events(events: List[Event]) -> ValidateResponse:
                 EventResult(index=index, type=event.type, status="violation", reason=reason)
             )
             violations.append(Violation(index=index, reason=reason))
+
+    return results, violations
+
+
+def validate_events(events: List[Event]) -> ValidateResponse:
+    """按顺序校验整条事件链，返回逐事件结果与全部违规。"""
+    state = ChainState()
+    results, violations = run_state_machine(state, events, index_offset=0)
 
     return ValidateResponse(
         valid=not violations,

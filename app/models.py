@@ -233,6 +233,52 @@ class ReconcileResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 超长事件链分段校验（/api/v1/seal-chain/validate-chunk）
+# ---------------------------------------------------------------------------
+
+
+class ValidateChunkRequest(BaseModel):
+    """分段校验请求：本段事件与上一段返回的不透明续接令牌。
+
+    首段不带 continuation_token；后续段必须携带上一响应返回的
+    next_continuation_token。逐事件判定与把所有分段拼接后调用单链校验
+    接口完全一致，结果下标使用全链偏移。
+    """
+
+    events: List[Event] = Field(default_factory=list, description="本段事件（按时间排列）")
+    continuation_token: Optional[str] = Field(
+        default=None,
+        description="上一响应返回的不透明续接令牌；首段不传或传 null",
+    )
+
+
+class ChunkSummary(BaseModel):
+    """截至本段末尾的全链累计摘要。"""
+
+    processed_events: int = Field(description="累计已处理事件数（含本段）")
+    violation_count: int = Field(description="累计违规事件数（含本段）")
+    valid: bool = Field(description="累计是否无任何违规")
+    sealed: bool = Field(description="处理完本段后是否处于封装状态")
+    final_custodian: Optional[str] = Field(description="当前保管人")
+    current_seal: Optional[str] = Field(description="当前有效封签编号，未封装时为 null")
+
+
+class ValidateChunkResponse(BaseModel):
+    """分段校验响应：本段结果、累计摘要与下一续接令牌。"""
+
+    events: List[EventResult] = Field(
+        description="本段逐事件状态；index 为全链偏移（从 0 开始），与拼接后单链校验一致"
+    )
+    violations: List[Violation] = Field(
+        description="本段违规事件的全链偏移位置与原因"
+    )
+    summary: ChunkSummary = Field(description="截至本段末尾的全链累计摘要")
+    next_continuation_token: str = Field(
+        description="供下一段使用的不透明续接令牌；本段为空段时同样返回可续接的令牌"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 开封暴露审计（/api/v1/seal-chain/exposure-audit）
 # ---------------------------------------------------------------------------
 

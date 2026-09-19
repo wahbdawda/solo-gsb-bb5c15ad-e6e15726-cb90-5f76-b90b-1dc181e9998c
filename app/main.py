@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 
 from .batch import validate_batch
+from .chunk import ChunkTokenError, validate_chunk
 from .exposure import ExposureAuditError, audit_exposure
 from .models import (
     BatchValidateRequest,
@@ -12,6 +13,8 @@ from .models import (
     ExposureAuditResponse,
     ReconcileRequest,
     ReconcileResponse,
+    ValidateChunkRequest,
+    ValidateChunkResponse,
     ValidateRequest,
     ValidateResponse,
 )
@@ -21,7 +24,7 @@ from .validator import validate_events
 app = FastAPI(
     title="封签链校验 API",
     description="用于展品运输交接场景的封签链状态机校验服务",
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -40,6 +43,24 @@ def health() -> dict:
 def validate(request: ValidateRequest) -> ValidateResponse:
     """按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态与全部违规。"""
     return validate_events(request.events)
+
+
+@app.post(
+    "/api/v1/seal-chain/validate-chunk",
+    response_model=ValidateChunkResponse,
+    tags=["seal-chain"],
+    summary="分段校验超长封签链（不透明令牌续接）",
+)
+def validate_chunk_endpoint(request: ValidateChunkRequest) -> ValidateChunkResponse:
+    """首段不带 continuation_token，后续段携带上一响应返回的不透明令牌；
+    逐事件判定与把所有分段拼接后调用现有单链接口完全一致，下标使用全链偏移。
+    令牌完整保存封装状态、保管人、当前及已用封签、最近有效时间与累计事件数，
+    并用环境变量密钥做确定性签名；篡改 / 版本不支持 / 状态字段非法均返回 422，
+    且不处理本段事件。"""
+    try:
+        return validate_chunk(request)
+    except ChunkTokenError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post(

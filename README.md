@@ -1,6 +1,6 @@
 # 封签链校验 API（Seal Chain Validation）
 
-用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；并提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长。
+用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；事件链过长时还可通过**分段校验**接口以不透明续接令牌分多段提交，判定结果与一次性提交完全一致；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；并提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长。
 
 ## 校验规则（状态机）
 
@@ -31,8 +31,9 @@ docker compose up --build
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `HOST_PORT` | `8000` | 宿主机映射端口，如 `HOST_PORT=9000 docker compose up --build` |
+| `SEAL_CHAIN_TOKEN_SECRET` | 内置开发默认值 | `/api/v1/seal-chain/validate-chunk` 续接令牌的 HMAC-SHA256 签名密钥；生产部署请显式注入稳定密钥（如 `SEAL_CHAIN_TOKEN_SECRET="$(openssl rand -hex 32)"`）。为空或未设置时回退到内置默认值；更换密钥后，此前签发的令牌会因签名不符返回 `422` 而无法续接 |
 
-容器内服务固定监听 `0.0.0.0:8000`。
+容器内服务固定监听 `0.0.0.0:8000`。一键启动仍为 `docker compose up --build`，两个变量均可省略；Compose 配置会把同名环境变量透传进容器。
 
 ## API 说明
 
@@ -94,6 +95,81 @@ curl -s http://localhost:8000/api/v1/seal-chain/validate \
         {"type": "seal", "timestamp": "2026-09-18T10:00:00Z", "seal_id": "S001", "custodian": "Alice"},
         {"type": "handover", "timestamp": "2026-09-18T11:00:00Z", "custodian": "Bob"}
       ]}'
+```
+
+### `POST /api/v1/seal-chain/validate-chunk`
+
+超长事件链分段校验。把一条链按顺序拆成多段提交：**首段不带 `continuation_token`**（或传 `null`），**后续段携带上一响应返回的 `next_continuation_token`**。
+
+- **判定完全等价**：逐事件判定（`ok` / `violation` 与原因）与把所有分段按提交顺序拼接后调用 `/validate` 完全一致；违规事件同样不改变状态、不阻止后续判定，跨段的时间戳严格递增检查以最近一个*有效*事件为基准，前序段已用封签在后续段同样不得复用。
+- **全链偏移下标**：每段响应中 `events[].index` / `violations[].index` 都是相对整条链（从 0 开始）的下标，而非段内下标——例如第二段首个事件的 `index` 等于第一段的事件数。
+- **不透明令牌**：`next_continuation_token` 完整保存继续推进状态机所需的全部状态——封装状态（`sealed` / `ever_sealed`）、保管人、当前封签、全部已用封签、最近有效事件时间，以及累计事件数与累计违规数；载荷经 base64url 编码并用 `SEAL_CHAIN_TOKEN_SECRET` 指定的密钥做**确定性 HMAC-SHA256 签名**（相同状态在同一密钥下令牌完全相同）。令牌不透明、单次有效语义上仅用于续接下一段，请原样回传，不要解析或修改。
+- **失败即 422 且不处理本段**：令牌签名不符（任何篡改或密钥不一致）、版本不支持，或任一状态字段非法（字段缺失 / 多余 / 类型非法 / 状态不变量矛盾）均返回 `422`，且**在令牌校验通过前绝不处理本段事件**。事件结构本身不合法（未知 `type`、缺少 `timestamp` 等）同样返回 `422`。
+- 允许提交空段（`events` 为空），响应仍返回可续接的 `next_continuation_token`，累计计数不变。
+
+**请求体**（第二段）
+
+```json
+{
+  "events": [
+    {"type": "unseal", "timestamp": "2026-09-18T12:00:00Z"},
+    {"type": "reseal", "timestamp": "2026-09-18T13:00:00Z", "seal_id": "S002", "custodian": "Bob"}
+  ],
+  "continuation_token": "eyJ2IjoxLC4uLn0.<hmac-sha256-签名>"
+}
+```
+
+**响应示例**（首段为 `seal@10`、`handover@11`，本段为第 3、4 个事件）
+
+```json
+{
+  "events": [
+    {"index": 2, "type": "unseal", "status": "ok", "reason": null, "cross_chain_conflict": false},
+    {"index": 3, "type": "reseal", "status": "ok", "reason": null, "cross_chain_conflict": false}
+  ],
+  "violations": [],
+  "summary": {
+    "processed_events": 4,
+    "violation_count": 0,
+    "valid": true,
+    "sealed": true,
+    "final_custodian": "Bob",
+    "current_seal": "S002"
+  },
+  "next_continuation_token": "eyJ2IjoxLC4uLn0.<hmac-sha256-签名>"
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `events[]` | **本段**逐事件状态，结构同单链接口；`index` 为**全链偏移**（从 0 开始） |
+| `violations[]` | 本段违规事件的**全链偏移**位置与原因 |
+| `summary` | 截至本段末尾的**累计**摘要 |
+| `summary.processed_events` | 累计已处理事件数（含本段），即下一段首个事件的全链下标 |
+| `summary.violation_count` / `summary.valid` | 累计违规数 / 全链是否至今无违规 |
+| `summary.sealed` / `final_custodian` / `current_seal` | 处理完本段后的当前状态，含义与单链接口一致 |
+| `next_continuation_token` | 供下一段原样回传的不透明令牌；空段同样返回 |
+
+### 分段校验接口示例调用
+
+```bash
+# 首段：不带 continuation_token
+RESP=$(curl -s http://localhost:8000/api/v1/seal-chain/validate-chunk \
+  -H 'Content-Type: application/json' \
+  -d '{"events": [
+        {"type": "seal", "timestamp": "2026-09-18T10:00:00Z", "seal_id": "S001", "custodian": "Alice"},
+        {"type": "handover", "timestamp": "2026-09-18T11:00:00Z", "custodian": "Bob"}
+      ]}')
+TOKEN=$(printf '%s' "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin)['next_continuation_token'])")
+
+# 后续段：携带上一响应的令牌；本段 index 从 2 开始
+curl -s http://localhost:8000/api/v1/seal-chain/validate-chunk \
+  -H 'Content-Type: application/json' \
+  -d "{\"events\": [
+        {\"type\": \"unseal\", \"timestamp\": \"2026-09-18T12:00:00Z\"},
+        {\"type\": \"reseal\", \"timestamp\": \"2026-09-18T13:00:00Z\", \"seal_id\": \"S002\", \"custodian\": \"Bob\"}
+      ],
+      \"continuation_token\": \"$TOKEN\"}"
 ```
 
 ### `POST /api/v1/seal-chain/batch-validate`
@@ -401,13 +477,15 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py        # FastAPI 入口与路由
-  models.py      # 请求 / 响应模型（单链、批量、合并重建与开封暴露审计）
-  validator.py   # 单链状态机校验核心
+  models.py      # 请求 / 响应模型（单链、分段、批量、合并重建与开封暴露审计）
+  validator.py   # 单链状态机校验核心（支持从保存状态续推，供分段校验复用）
+  chunk.py       # 超长链分段校验（不透明令牌编解码 / HMAC 签名 / 续接推进）
   batch.py       # 批量封签占用检查（跨链冲突）
   reconcile.py   # 离线片段合并重建（去重 / 结构诊断 / 调用单链校验）
   exposure.py    # 开封暴露审计（开封区间推导 / 窗口合并 / 区间差）
 tests/
   test_validator.py
+  test_chunk.py
   test_batch.py
   test_reconcile.py
   test_exposure.py
