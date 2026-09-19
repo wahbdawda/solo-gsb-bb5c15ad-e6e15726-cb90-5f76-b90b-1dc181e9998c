@@ -296,3 +296,45 @@ class ExposureAuditResponse(BaseModel):
     unauthorized_seconds: float = Field(
         default=0.0, description="未授权暴露总秒数，即全部 uncovered 分段秒数之和"
     )
+
+
+# ---------------------------------------------------------------------------
+# 超长事件链分段校验（/api/v1/seal-chain/validate-chunk）
+# ---------------------------------------------------------------------------
+
+
+class ChunkValidateRequest(BaseModel):
+    """分段校验请求：首段不带 continuation_token，后续段携带上一响应返回的令牌。"""
+
+    events: List[Event] = Field(default_factory=list, description="本段事件，按时间排列")
+    continuation_token: Optional[str] = Field(
+        default=None,
+        description="上一响应返回的续传令牌（不透明字符串）；首段不传或为 null",
+    )
+
+
+class ChunkSummary(BaseModel):
+    """全链累计摘要（含本段）。"""
+
+    event_count: int = Field(description="全链已累计处理的事件总数（含违规事件）")
+    violation_count: int = Field(description="全链累计违规事件数")
+    valid: bool = Field(description="全链截至目前是否无任何违规")
+    sealed: bool = Field(description="处理完所有有效事件后当前是否处于封装状态")
+    custodian: Optional[str] = Field(description="当前保管人")
+    current_seal: Optional[str] = Field(description="当前有效封签编号，未封装时为 null")
+
+
+class ChunkValidateResponse(BaseModel):
+    """分段校验响应：本段结果 + 全链累计摘要 + 下一段续传令牌。"""
+
+    events: List[EventResult] = Field(
+        description="本段逐事件判定结果；index 为全链偏移（从 0 开始），"
+        "与把所有分段拼接后调用单链接口完全一致"
+    )
+    violations: List[Violation] = Field(
+        description="本段违规事件的位置（全链偏移）与原因"
+    )
+    summary: ChunkSummary = Field(description="全链累计摘要（含本段）")
+    continuation_token: str = Field(
+        description="下一段请求需携带的续传令牌（不透明字符串，带签名）"
+    )

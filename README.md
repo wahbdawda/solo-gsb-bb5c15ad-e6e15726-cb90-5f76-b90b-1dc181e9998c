@@ -1,6 +1,6 @@
 # 封签链校验 API（Seal Chain Validation）
 
-用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；并提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长。
+用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长；并提供**分段校验**接口，把超长事件链拆成若干段依次校验，段间通过带签名的续传令牌传递状态机状态，结果与整链一次校验完全一致。
 
 ## 校验规则（状态机）
 
@@ -31,6 +31,7 @@ docker compose up --build
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `HOST_PORT` | `8000` | 宿主机映射端口，如 `HOST_PORT=9000 docker compose up --build` |
+| `SEAL_CHAIN_TOKEN_SECRET` | `seal-chain-dev-secret` | 分段校验续传令牌的 HMAC-SHA256 签名密钥。**仅用于本地开发的默认值，生产环境务必覆盖**，如 `SEAL_CHAIN_TOKEN_SECRET=$(openssl rand -hex 32) docker compose up --build`；变更密钥后旧令牌全部失效（验签失败返回 `422`） |
 
 容器内服务固定监听 `0.0.0.0:8000`。
 
@@ -386,6 +387,115 @@ curl -s http://localhost:8000/api/v1/seal-chain/exposure-audit \
 # start 晚于 end，返回 422
 ```
 
+### `POST /api/v1/seal-chain/validate-chunk`
+
+分段校验超长事件链。把一条长链拆成若干段依次提交：**首段不带 `continuation_token`**，响应返回不透明的**续传令牌**；后续段携带上一响应返回的令牌，即可从上一段结束时的状态机状态继续校验。**逐事件判定与把所有分段拼接后调用 `/api/v1/seal-chain/validate` 完全一致**，响应中的 `index` 为全链偏移（从 0 开始）。
+
+**续传令牌**
+
+- 令牌完整保存：封装状态（含是否曾封装）、保管人、当前及已用封签、最近有效事件时间与累计事件数（另含累计违规数，用于累计摘要）；
+- 格式为 `base64url(负载JSON) + "." + base64url(HMAC-SHA256 签名)`，负载键序固定、封签列表排序，签名密钥取自环境变量 `SEAL_CHAIN_TOKEN_SECRET`——**确定性签名**：同一状态 + 同一密钥必然得到同一令牌；
+- 令牌在处理本段事件**之前**校验：**任何篡改（签名不匹配）、版本不支持或状态字段非法（类型非法 / 自相矛盾的状态）均返回 `422`，本段事件不会被处理**，也不会签发新令牌——用上一响应的原令牌重发本段即可。
+
+**请求体（首段）**
+
+```json
+{
+  "events": [
+    {"type": "seal",     "timestamp": "2026-09-18T10:00:00Z", "seal_id": "S001", "custodian": "Alice"},
+    {"type": "handover", "timestamp": "2026-09-18T11:00:00Z", "custodian": "Bob"}
+  ]
+}
+```
+
+**响应示例（首段）**
+
+```json
+{
+  "events": [
+    {"index": 0, "type": "seal", "status": "ok", "reason": null, "cross_chain_conflict": false},
+    {"index": 1, "type": "handover", "status": "ok", "reason": null, "cross_chain_conflict": false}
+  ],
+  "violations": [],
+  "summary": {
+    "event_count": 2,
+    "violation_count": 0,
+    "valid": true,
+    "sealed": true,
+    "custodian": "Bob",
+    "current_seal": "S001"
+  },
+  "continuation_token": "eyJjdXJyZW50X3NlYWwiOiJTMDAxIiwiY3VzdG9kaWFuIjoiQm9iIiwiZXZlbnRfY291bnQiOjIsImV2ZXJfc2VhbGVkIjp0cnVlLCJsYXN0X3RpbWVzdGFtcCI6IjIwMjYtMDktMThUMTE6MDA6MDArMDA6MDAiLCJzZWFsZWQiOnRydWUsInVzZWRfc2VhbHMiOlsiUzAwMSJdLCJ2IjoxLCJ2aW9sYXRpb25fY291bnQiOjB9.RRZPGN2jN-GmdhWnI2ji82ON-ZA7TUiFvYd-N3k_P9k"
+}
+```
+
+**请求体（后续段，携带上一响应的令牌）**
+
+```json
+{
+  "events": [
+    {"type": "unseal", "timestamp": "2026-09-18T12:00:00Z"},
+    {"type": "reseal", "timestamp": "2026-09-18T13:00:00Z", "seal_id": "S002", "custodian": "Bob"}
+  ],
+  "continuation_token": "eyJjdXJyZW50X3NlYWwiOiJTMDAxIiwiY3VzdG9kaWFuIjoiQm9iIiwiZXZlbnRfY291bnQiOjIsImV2ZXJfc2VhbGVkIjp0cnVlLCJsYXN0X3RpbWVzdGFtcCI6IjIwMjYtMDktMThUMTE6MDA6MDArMDA6MDAiLCJzZWFsZWQiOnRydWUsInVzZWRfc2VhbHMiOlsiUzAwMSJdLCJ2IjoxLCJ2aW9sYXRpb25fY291bnQiOjB9.RRZPGN2jN-GmdhWnI2ji82ON-ZA7TUiFvYd-N3k_P9k"
+}
+```
+
+**响应示例（后续段：`index` 为全链偏移，`summary` 为全链累计）**
+
+```json
+{
+  "events": [
+    {"index": 2, "type": "unseal", "status": "ok", "reason": null, "cross_chain_conflict": false},
+    {"index": 3, "type": "reseal", "status": "ok", "reason": null, "cross_chain_conflict": false}
+  ],
+  "violations": [],
+  "summary": {
+    "event_count": 4,
+    "violation_count": 0,
+    "valid": true,
+    "sealed": true,
+    "custodian": "Bob",
+    "current_seal": "S002"
+  },
+  "continuation_token": "eyJjdXJyZW50X3NlYWwiOiJTMDAyIiwiY3VzdG9kaWFuIjoiQm9iIiwiZXZlbnRfY291bnQiOjQsImV2ZXJfc2VhbGVkIjp0cnVlLCJsYXN0X3RpbWVzdGFtcCI6IjIwMjYtMDktMThUMTM6MDA6MDArMDA6MDAiLCJzZWFsZWQiOnRydWUsInVzZWRfc2VhbHMiOlsiUzAwMSIsIlMwMDIiXSwidiI6MSwidmlvbGF0aW9uX2NvdW50IjowfQ.Yf7FQcU-wfNAZQNshH1X6tGeJAnHxwntr_k1TG1xEsI"
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `events[]` | 本段逐事件判定结果；`index` 为全链偏移，与整链一次校验完全一致 |
+| `violations[]` | 本段违规事件的位置（全链偏移）与原因 |
+| `summary.event_count` | 全链已累计处理的事件总数（含违规事件），即下一段的起始偏移 |
+| `summary.violation_count` | 全链累计违规事件数 |
+| `summary.valid` | 全链截至目前是否无任何违规 |
+| `summary.sealed` / `custodian` / `current_seal` | 当前封装状态 / 保管人 / 当前有效封签 |
+| `continuation_token` | 下一段请求需携带的续传令牌（不透明字符串）；链未校验完时持续接力 |
+
+> 令牌校验失败返回 `422` 的常见原因：令牌被篡改或密钥变更（签名不匹配）、令牌版本不支持、负载状态字段非法。`422` 不会推进任何状态，用上一响应的原令牌重发本段即可继续。事件结构不合法（如未知 `type`）同样返回 `422`。
+
+### 分段校验接口示例调用
+
+```bash
+# 首段：不带 continuation_token
+curl -s http://localhost:8000/api/v1/seal-chain/validate-chunk \
+  -H 'Content-Type: application/json' \
+  -d '{"events": [
+        {"type": "seal", "timestamp": "2026-09-18T10:00:00Z", "seal_id": "S001", "custodian": "Alice"},
+        {"type": "handover", "timestamp": "2026-09-18T11:00:00Z", "custodian": "Bob"}
+      ]}'
+# → 从响应中取出 continuation_token
+
+# 后续段：携带上一响应返回的令牌
+curl -s http://localhost:8000/api/v1/seal-chain/validate-chunk \
+  -H 'Content-Type: application/json' \
+  -d '{"events": [
+        {"type": "unseal", "timestamp": "2026-09-18T12:00:00Z"},
+        {"type": "reseal", "timestamp": "2026-09-18T13:00:00Z", "seal_id": "S002", "custodian": "Bob"}
+      ],
+      "continuation_token": "<上一响应返回的 continuation_token>"}'
+```
+
 > 服务默认监听宿主机 **8000** 端口（容器内固定 `0.0.0.0:8000`，可用 `HOST_PORT` 覆盖），以上示例中的 `http://localhost:8000` 即该端口。
 
 ## 本地开发与测试
@@ -401,16 +511,18 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py        # FastAPI 入口与路由
-  models.py      # 请求 / 响应模型（单链、批量、合并重建与开封暴露审计）
+  models.py      # 请求 / 响应模型（单链、批量、合并重建、开封暴露审计与分段校验）
   validator.py   # 单链状态机校验核心
   batch.py       # 批量封签占用检查（跨链冲突）
   reconcile.py   # 离线片段合并重建（去重 / 结构诊断 / 调用单链校验）
   exposure.py    # 开封暴露审计（开封区间推导 / 窗口合并 / 区间差）
+  chunk.py       # 分段校验（续传令牌签发 / 验签 / 状态还原）
 tests/
   test_validator.py
   test_batch.py
   test_reconcile.py
   test_exposure.py
+  test_chunk.py
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -98,11 +98,22 @@ def _apply_event(state: ChainState, event: Event) -> None:
 
 def validate_events(events: List[Event]) -> ValidateResponse:
     """按顺序校验整条事件链，返回逐事件结果与全部违规。"""
-    state = ChainState()
+    return validate_events_from(ChainState(), events)
+
+
+def validate_events_from(
+    state: ChainState, events: List[Event], index_offset: int = 0
+) -> ValidateResponse:
+    """从给定状态继续校验事件序列，逐事件下标从 ``index_offset`` 起算。
+
+    与 ``validate_events`` 共用同一套状态机规则；``state`` 会被就地推进，
+    调用结束后即为处理完全部事件的状态（分段校验据此生成续传令牌）。
+    """
     results: List[EventResult] = []
     violations: List[Violation] = []
 
-    for index, event in enumerate(events):
+    for offset, event in enumerate(events):
+        index = index_offset + offset
         reason = _check_event(state, event)
         if reason is None:
             _apply_event(state, event)
