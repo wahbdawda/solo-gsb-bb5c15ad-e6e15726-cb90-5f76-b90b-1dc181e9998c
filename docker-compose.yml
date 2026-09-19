@@ -1,0 +1,8 @@
+services:
+  api:
+    build: .
+    image: seal-chain-api:latest
+    container_name: seal-chain-api
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    restart: unless-stopped
